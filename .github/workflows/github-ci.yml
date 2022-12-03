@@ -1,0 +1,79 @@
+name: Release Prod
+on:
+  push:
+    branches:
+      - 'main'
+  workflow_dispatch:
+
+jobs:
+    pipeline:
+        runs-on: self-hosted
+        timeout-minutes: 25
+        env:
+            AWS_REPO_URL: accountid.dkr.ecr.us-east-1.amazonaws.com
+            AWS_REPO_NAME: verdaccio
+            TAG: 5.13
+            EKS_CLUSTER: EKS-CLUSTER-NAME
+            HELM_REPOSITORY: https://charts.verdaccio.org
+            HELM_RELEASE: npm
+            NAMESPACE: registry-services
+            HELM_CHART: verdaccio/verdaccio
+            VERDACCIO_PUBLIC_URL: https://registry.org.com
+            DOCKER_BUILDKIT: 1
+            SECRET: VERDACCIO_PROD
+        steps:
+            - uses: actions/checkout@v2
+            - uses: actions/setup-node@v2
+              with:
+                node-version: '14'
+            - uses: actions/setup-python@v2
+              with:
+                python-version: '3.x'
+            - uses: aws-actions/configure-aws-credentials@v1
+              with:
+                aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                aws-region: us-east-1
+            - name: Read secrets from AWS Secrets Manager into environment variables
+              uses: abhilash1in/aws-secrets-manager-action@v2.1.0
+              with:
+                secrets: |
+                  verdaccio-prod
+                parse-json: true
+            - name: Set Environment Variables from Secret Manager
+              run: |
+                  export BUCKET="${${{ env.SECRET }}_BUCKET}"
+                  export ACCESSKEYID="${${{ env.SECRET }}_ACCESSKEYID}"
+                  export SECRETACCESSKEY="${${{ env.SECRET }}_SECRETACCESSKEY}"
+                  export CLIENTID="${${{ env.SECRET }}_CLIENT_ID}"
+                  export CLIENTSECRET="${${{ env.SECRET }}_CLIENT_SECRET}"
+                  export TOKEN="${${{ env.SECRET }}_TOKEN}"
+                  export ORG="${${{ env.SECRET }}_ORG}"
+                  envsubst < config-env.yaml >  config.yaml
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v1
+            - name: Build and push docker image
+              run: |
+                  docker build -t ${{ env.AWS_REPO_NAME }}:latest .
+                  docker tag ${{ env.AWS_REPO_NAME }}:latest ${{ env.AWS_REPO_URL }}/${{ env.AWS_REPO_NAME }}:${{ env.TAG}}
+                  docker push ${{ env.AWS_REPO_URL }}/${{ env.AWS_REPO_NAME }}:${{ env.TAG}}
+            - name: Connect to EKS Cluster
+              run: |
+                  aws eks update-kubeconfig --region us-east-1 --name ${{ env.EKS_CLUSTER}}
+            - name: Apply ConfigMap
+              run: |
+                  kubectl create configmap verdaccio-config \
+                      --from-file=./config.yaml \
+                      -n ${{ env.NAMESPACE }} \
+                      -o yaml \
+                      --dry-run | kubectl apply -f -
+            - name: Deploy Verdaccio
+              run: |
+                  helm repo add verdaccio ${{ env.HELM_REPOSITORY }}
+                  helm upgrade --install ${{ env.HELM_RELEASE }} -n ${{ env.NAMESPACE }} ${{ env.HELM_CHART }} \
+                    --set image.repository=${{ env.AWS_REPO_URL }}/${{ env.AWS_REPO_NAME }} \
+                    --set image.tag=${{ env.TAG}} \
+                    --set existingConfigMap=verdaccio-config \
+                    --set extraEnvVars\[0\].name="VERDACCIO_PUBLIC_URL" \
+                    --set extraEnvVars\[0\].value=${{ env.VERDACCIO_PUBLIC_URL }}
